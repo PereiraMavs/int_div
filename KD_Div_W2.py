@@ -15,7 +15,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"🚀 Running on: {DEVICE}")
 
 # Training Params
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 EPOCHS = 400
 LATENT_DIM = 32     # Generator Noise Dimension
 NUM_BINS = 8        # Bins per feature (K)
@@ -29,7 +29,7 @@ REPLAY_BUFFER_SIZE = 1000  # Maximum samples to store
 REPLAY_RATIO = 0.10  # 10% of batch will be replay samples
 
 # Weights
-LAMBDA_COV = 3.0    # Weight for Interaction Diversity (Entropy)
+LAMBDA_COV = 10.0    # Weight for Interaction Diversity (Entropy)
 LAMBDA_HARD = 2.0   # Weight for Adversarial Hardness
 
 # ==========================================
@@ -38,7 +38,7 @@ LAMBDA_HARD = 2.0   # Weight for Adversarial Hardness
 print("\n📊 Loading Data...")
 
 # ====== CHANGE DATASET HERE ======
-DATASET_NAME = 'mushroom'  # Store dataset name for graph filenames
+DATASET_NAME = 'credit'  # Store dataset name for graph filenames
 X_train, X_test, y_train, y_test, X_min, X_max, col_names, scaler, ht, NUM_CLASSES = datasets.load_dataset(DATASET_NAME)
 
 # Auto-detect dimensions
@@ -386,7 +386,7 @@ class VarianceBasedBinLoss(nn.Module):
         # 3. Compute HARD-ASSIGNMENT variances for monitoring
         intra_var, inter_var, _, _ = calculate_hard_variance(membership, teacher_probs)
         
-        return 1.0 * loss_intra + (3.0 * loss_inter), loss_intra, loss_inter, intra_var, inter_var
+        return 2.0 * loss_intra + (3.0 * loss_inter), loss_intra, loss_inter, intra_var, inter_var
 
 # ==========================================
 # 3.5 COVERAGE CERTIFICATION
@@ -436,6 +436,44 @@ def compute_coverage(membership, threshold=5):
         coverage_ratio = covered_pairs / total_pairs if total_pairs > 0 else 0.0
         
     return coverage_ratio, coverage_matrix
+
+def update_cumulative_coverage(membership, cumulative_tracker):
+    """
+    Update cumulative coverage tracker with new samples.
+    
+    Args:
+        membership: Tensor of shape (N, F, K) - soft membership values
+        cumulative_tracker: Boolean tensor (F, F, K, K) tracking visited bin pairs
+    
+    Returns:
+        cumulative_coverage_ratio: Fraction of all possible bin pairs visited so far
+    """
+    N, F, K = membership.shape
+    
+    with torch.no_grad():
+        hard_assignments = membership.argmax(dim=2)  # (N, F)
+        
+        # Update tracker for each sample
+        for n in range(N):
+            for i in range(F):
+                for j in range(i + 1, F):
+                    bin_i = hard_assignments[n, i].item()
+                    bin_j = hard_assignments[n, j].item()
+                    cumulative_tracker[i, j, bin_i, bin_j] = True
+                    cumulative_tracker[j, i, bin_j, bin_i] = True  # Symmetric
+        
+        # Count covered pairs
+        num_feature_pairs = (F * (F - 1)) // 2
+        total_bin_pairs = num_feature_pairs * K * K
+        covered_bin_pairs = 0
+        
+        for i in range(F):
+            for j in range(i + 1, F):
+                covered_bin_pairs += cumulative_tracker[i, j].sum().item()
+        
+        cumulative_coverage_ratio = covered_bin_pairs / total_bin_pairs if total_bin_pairs > 0 else 0.0
+        
+    return cumulative_coverage_ratio
 
 # ==========================================
 # 4. TRAINING PIPELINE
@@ -644,7 +682,7 @@ with open(f'reports/bin_boundaries_{DATASET_NAME}.txt', 'w') as f:
     f.write(f"Checkpoints captured: {len(boundary_history)}\n\n")
     
     # For each feature, show boundary evolution
-    for feature_idx in range(min(5, DATA_DIM)):  # Show first 5 features
+    for feature_idx in range(DATA_DIM):  # Show all features
         f.write("=" * 100 + "\n")
         f.write(f"FEATURE {feature_idx} - Boundary Evolution\n")
         f.write("=" * 100 + "\n\n")
@@ -892,7 +930,7 @@ for param in bin_learner.parameters():
     param.requires_grad = False
 
 # Set temperature for Phase 2 (generator training)
-bin_learner.temperature = 0.1  # Moderate softness for smooth gradients
+bin_learner.temperature = 0.2  # Hard boundaries for discrete coverage
 
 # Losses & Optimizers
 loss_div_fn = InteractionDiversityLoss(t_way=2)
@@ -908,6 +946,46 @@ scheduler_stu = optim.lr_scheduler.CosineAnnealingLR(opt_stu, T_max=EPOCHS)
 generator_variance_history = []
 variance_checkpoints = list(range(0, EPOCHS + 1, 25))  # Every 25 epochs
 
+# Initialize cumulative coverage tracker
+print(f"   Initializing cumulative coverage tracker...")
+num_feature_pairs = (DATA_DIM * (DATA_DIM - 1)) // 2
+total_possible_pairs = num_feature_pairs * NUM_BINS * NUM_BINS
+cumulative_coverage_tracker = torch.zeros(DATA_DIM, DATA_DIM, NUM_BINS, NUM_BINS, dtype=torch.bool, device=DEVICE)
+print(f"   Total possible bin pairs to explore: {total_possible_pairs}")
+
+def compute_coverage_bonus(membership, cumulative_tracker):
+    """
+    Reward generator for hitting unexplored bin pairs.
+    Returns negative loss (reward) when visiting new bins.
+    """
+    N, F, K = membership.shape
+    
+    with torch.no_grad():
+        hard_assignments = membership.argmax(dim=2)  # (N, F)
+    
+    novelty_score = 0.0
+    total_samples = 0
+    
+    for n in range(N):
+        sample_novelty = 0.0
+        for i in range(F):
+            for j in range(i + 1, F):
+                bin_i = hard_assignments[n, i].item()
+                bin_j = hard_assignments[n, j].item()
+                
+                # Reward if this bin pair hasn't been visited
+                if not cumulative_tracker[i, j, bin_i, bin_j]:
+                    sample_novelty += 1.0
+        
+        novelty_score += sample_novelty
+        total_samples += 1
+    
+    # Average novelty per sample
+    avg_novelty = novelty_score / (total_samples * ((F * (F - 1)) // 2))
+    
+    # Return negative (reward for novelty)
+    return -avg_novelty
+
 # History tracking
 history = {
     'diversity': [],       # Diversity loss
@@ -915,11 +993,12 @@ history = {
     'student': [],         # Student KD loss
     'test_acc': [],
     'agreement': [],
-    'coverage': []
+    'coverage_snapshot': [],      # Snapshot coverage (current 1000 samples)
+    'coverage_cumulative': []     # Cumulative coverage (all samples seen)
 }
 
-print(f"\n{'Epoch':<6} | {'Div':<8} | {'Hard':<8} | {'Stu':<8} | {'Test Acc':<10} | {'Agreement':<10} | {'Coverage':<10}")
-print("-" * 100)
+print(f"\n{'Epoch':<6} | {'Div':<8} | {'Hard':<8} | {'Stu':<8} | {'Test Acc':<10} | {'Agreement':<10} | {'Cov (Snap)':<12} | {'Cov (Cumul)':<12}")
+print("-" * 120)
 
 best_student_state = None
 best_agreement_score = 0.0
@@ -928,26 +1007,27 @@ for epoch in range(1, EPOCHS + 1):
     z = torch.randn(BATCH_SIZE, LATENT_DIM).to(DEVICE)
     
     # ==========================
-    # GENERATOR UPDATE (Diversity + Hardness)
+    # GENERATOR UPDATE (Diversity + Hardness + Coverage Bonus)
     # ==========================
     opt_gen.zero_grad()
     x_gen = generator(z)
-    
+
     # 1. Interaction Diversity (Maximize Entropy)
-    # Bin learner is frozen, so gradients flow through x_gen only
     mship = bin_learner(x_gen)
     l_div = loss_div_fn(mship)
-    
+
     # 2. Hardness (Maximize Student Error)
     with torch.no_grad():
         t_probs = F.softmax(teacher(x_gen), dim=1)
     s_log_probs = F.log_softmax(student(x_gen), dim=1)
-    
-    # Minimize Negative KL (equivalent to maximizing KL divergence)
     l_hard = -1.0 * F.kl_div(s_log_probs, t_probs, reduction='batchmean')
-    
-    l_gen = (LAMBDA_COV * l_div) + (LAMBDA_HARD * l_hard)
-    
+
+    # 3. Coverage Bonus (Reward unexplored bins)
+    l_coverage = compute_coverage_bonus(mship, cumulative_coverage_tracker)
+
+    # Combine losses
+    l_gen = (LAMBDA_COV * l_div) + (LAMBDA_HARD * l_hard) + (8.0 * l_coverage)
+
     if not torch.isnan(l_gen):
         l_gen.backward()
         torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
@@ -983,6 +1063,14 @@ for epoch in range(1, EPOCHS + 1):
         opt_stu.step()
     
     # ==========================
+    # UPDATE CUMULATIVE COVERAGE (Every Epoch)
+    # ==========================
+    with torch.no_grad():
+        # Use the batch we just generated for student
+        mship_batch = bin_learner(x_gen_stu)
+        cumulative_cov = update_cumulative_coverage(mship_batch, cumulative_coverage_tracker)
+    
+    # ==========================
     # VARIANCE TRACKING ON GENERATOR DATA (Every 25 epochs)
     # ==========================
     if epoch in variance_checkpoints:
@@ -1013,6 +1101,7 @@ for epoch in range(1, EPOCHS + 1):
     history['diversity'].append(l_div.item())
     history['hardness'].append(l_hard.item())
     history['student'].append(l_stu.item())
+    history['coverage_cumulative'].append(cumulative_cov)
     
     if epoch % 20 == 0:
         student.eval()
@@ -1022,19 +1111,19 @@ for epoch in range(1, EPOCHS + 1):
             test_acc = accuracy_score(y_test, s_test_preds.cpu().numpy())
             agreement = (t_test_preds == s_test_preds).float().mean().item()
             
-            # Compute coverage certification
+            # Compute SNAPSHOT coverage (fresh 1000 samples)
             z_cov = torch.randn(1000, LATENT_DIM).to(DEVICE)
             x_cov = generator(z_cov)
             mship_cov = bin_learner(x_cov)
-            coverage_ratio, _ = compute_coverage(mship_cov, threshold=5)
-            
+            snapshot_cov, _ = compute_coverage(mship_cov, threshold=1)
+        
         history['test_acc'].append(test_acc)
         history['agreement'].append(agreement)
-        history['coverage'].append(coverage_ratio)
+        history['coverage_snapshot'].append(snapshot_cov)
         
         student.train()
         
-        print(f"{epoch:<6} | {l_div.item():<8.1f} | {l_hard.item():<8.3f} | {l_stu.item():<8.3f} | {test_acc*100:<10.1f}% | {agreement*100:<10.1f}% | {coverage_ratio*100:<10.1f}%")
+        print(f"{epoch:<6} | {l_div.item():<8.1f} | {l_hard.item():<8.3f} | {l_stu.item():<8.3f} | {test_acc*100:<10.1f}% | {agreement*100:<10.1f}% | {snapshot_cov*100:<12.1f}% | {cumulative_cov*100:<12.1f}%")
         
         # Track best student model
         if agreement > best_agreement_score:
@@ -1044,161 +1133,26 @@ for epoch in range(1, EPOCHS + 1):
                 'model_state_dict': student.state_dict(),
                 'test_acc': test_acc,
                 'agreement': agreement,
-                'coverage': coverage_ratio
+                'coverage_snapshot': snapshot_cov,
+                'coverage_cumulative': cumulative_cov
             }
 
-# ==========================================
-# D.1 GENERATOR VARIANCE EVOLUTION REPORT
-# ==========================================
-print("\n📊 Generating variance evolution report on generator data...")
+print(f"\n✅ Phase 2 Complete!")
+print(f"   Best Student (Epoch {best_student_state['epoch']}):")
+print(f"   - Test Accuracy: {best_student_state['test_acc']*100:.2f}%")
+print(f"   - Agreement with Teacher: {best_student_state['agreement']*100:.2f}%")
+print(f"   - Snapshot Coverage: {best_student_state['coverage_snapshot']*100:.2f}%")
+print(f"   - Cumulative Coverage: {best_student_state['coverage_cumulative']*100:.2f}%")
+print(f"   - Total bin pairs explored: {int(best_student_state['coverage_cumulative'] * total_possible_pairs)} / {total_possible_pairs}")
 
-with open(f'reports/variance_evolution_{DATASET_NAME}.txt', 'w') as f:
-    f.write("=" * 120 + "\n")
-    f.write("BIN VARIANCE EVOLUTION DURING GENERATOR TRAINING (Phase 2)\n")
-    f.write("=" * 120 + "\n\n")
-    f.write(f"Dataset: {DATASET_NAME}\n")
-    f.write(f"Features: {DATA_DIM}\n")
-    f.write(f"Bins per feature: {NUM_BINS}\n")
-    f.write(f"Generator training epochs: {EPOCHS}\n")
-    f.write(f"Checkpoints captured: {len(generator_variance_history)}\n")
-    f.write(f"Evaluated on: 2000 generated samples per checkpoint\n\n")
-    
-    # Overall variance evolution
-    f.write("=" * 120 + "\n")
-    f.write("OVERALL VARIANCE EVOLUTION ON GENERATED DATA\n")
-    f.write("=" * 120 + "\n\n")
-    
-    f.write(f"{'Epoch':<8} | {'Overall Intra-Var':<18} | {'Overall Inter-Var':<18} | {'Quality Ratio':<15} | {'Trend':<15}\n")
-    f.write("-" * 100 + "\n")
-    
-    for i, entry in enumerate(generator_variance_history):
-        epoch = entry['epoch']
-        intra = entry['intra_var']
-        inter = entry['inter_var']
-        quality_ratio = inter / (intra + 1e-8)
-        
-        # Trend indicator
-        if i > 0:
-            prev_quality = generator_variance_history[i-1]['inter_var'] / (generator_variance_history[i-1]['intra_var'] + 1e-8)
-            if quality_ratio > prev_quality * 1.05:
-                trend = "↑ Improving"
-            elif quality_ratio < prev_quality * 0.95:
-                trend = "↓ Degrading"
-            else:
-                trend = "→ Stable"
-        else:
-            trend = "Initial"
-        
-        f.write(f"{epoch:<8} | {intra:<18.6f} | {inter:<18.6f} | {quality_ratio:<15.2f} | {trend:<15}\n")
-    
-    # Summary
-    initial_quality = generator_variance_history[0]['inter_var'] / (generator_variance_history[0]['intra_var'] + 1e-8)
-    final_quality = generator_variance_history[-1]['inter_var'] / (generator_variance_history[-1]['intra_var'] + 1e-8)
-    improvement = ((final_quality - initial_quality) / initial_quality) * 100
-    
-    f.write("\n")
-    f.write(f"Initial Quality Ratio: {initial_quality:.2f}\n")
-    f.write(f"Final Quality Ratio:   {final_quality:.2f}\n")
-    f.write(f"Improvement:           {improvement:+.1f}%\n\n")
-    
-    # Per-feature variance evolution
-    for feature_idx in range(DATA_DIM):
-        f.write("=" * 120 + "\n")
-        f.write(f"FEATURE {feature_idx} - VARIANCE EVOLUTION ON GENERATED DATA\n")
-        f.write("=" * 120 + "\n\n")
-        
-        # Inter-bin variance evolution for this feature
-        f.write("Inter-Bin Variance (higher = better separation)\n")
-        f.write(f"{'Epoch':<8} | ")
-        for entry in generator_variance_history:
-            f.write(f"{entry['epoch']:<10} | ")
-        f.write("\n")
-        f.write("-" * 120 + "\n")
-        f.write(f"{'Value':<8} | ")
-        for entry in generator_variance_history:
-            inter_var_feat = entry['inter_variance_per_feature'][feature_idx].item()
-            f.write(f"{inter_var_feat:<10.6f} | ")
-        f.write("\n\n")
-        
-        # Intra-bin variance evolution for each bin
-        f.write("Intra-Bin Variance per Bin (lower = purer bins)\n")
-        f.write(f"{'Bin':<8} | ")
-        for entry in generator_variance_history:
-            f.write(f"Epoch {entry['epoch']:<4} | ")
-        f.write("\n")
-        f.write("-" * 120 + "\n")
-        
-        for bin_idx in range(NUM_BINS):
-            f.write(f"Bin {bin_idx:<4} | ")
-            for entry in generator_variance_history:
-                intra_var_bin = entry['variance_map'][feature_idx, bin_idx].item()
-                f.write(f"{intra_var_bin:<10.6f} | ")
-            f.write("\n")
-        
-        f.write("\n")
-        
-        # Feature summary
-        initial_inter = generator_variance_history[0]['inter_variance_per_feature'][feature_idx].item()
-        final_inter = generator_variance_history[-1]['inter_variance_per_feature'][feature_idx].item()
-        inter_change = final_inter - initial_inter
-        
-        initial_intra_avg = generator_variance_history[0]['variance_map'][feature_idx, :].mean().item()
-        final_intra_avg = generator_variance_history[-1]['variance_map'][feature_idx, :].mean().item()
-        intra_change = final_intra_avg - initial_intra_avg
-        
-        f.write(f"Feature {feature_idx} Summary:\n")
-        f.write(f"  Inter-Bin Variance:  {initial_inter:.6f} → {final_inter:.6f} (change: {inter_change:+.6f})\n")
-        f.write(f"  Avg Intra-Bin Var:   {initial_intra_avg:.6f} → {final_intra_avg:.6f} (change: {intra_change:+.6f})\n")
-        
-        if inter_change > 0.01:
-            f.write(f"  ✅ Inter-bin separation IMPROVED\n")
-        elif inter_change < -0.01:
-            f.write(f"  ❌ Inter-bin separation DEGRADED\n")
-        else:
-            f.write(f"  → Inter-bin separation STABLE\n")
-        
-        if intra_change < -0.01:
-            f.write(f"  ✅ Bin purity IMPROVED (variance decreased)\n")
-        elif intra_change > 0.01:
-            f.write(f"  ❌ Bin purity DEGRADED (variance increased)\n")
-        else:
-            f.write(f"  → Bin purity STABLE\n")
-        
-        f.write("\n\n")
-    
-    # Overall assessment
-    f.write("=" * 120 + "\n")
-    f.write("GENERATOR TRAINING PROGRESS ASSESSMENT\n")
-    f.write("=" * 120 + "\n\n")
-    
-    improved_features = 0
-    degraded_features = 0
-    stable_features = 0
-    
-    for feature_idx in range(DATA_DIM):
-        initial_quality_feat = generator_variance_history[0]['inter_variance_per_feature'][feature_idx].item() / \
-                               (generator_variance_history[0]['variance_map'][feature_idx, :].mean().item() + 1e-8)
-        final_quality_feat = generator_variance_history[-1]['inter_variance_per_feature'][feature_idx].item() / \
-                             (generator_variance_history[-1]['variance_map'][feature_idx, :].mean().item() + 1e-8)
-        
-        if final_quality_feat > initial_quality_feat * 1.1:
-            improved_features += 1
-        elif final_quality_feat < initial_quality_feat * 0.9:
-            degraded_features += 1
-        else:
-            stable_features += 1
-    
-    f.write(f"Features Improved:  {improved_features} / {DATA_DIM} ({improved_features/DATA_DIM*100:.1f}%)\n")
-    f.write(f"Features Degraded:  {degraded_features} / {DATA_DIM} ({degraded_features/DATA_DIM*100:.1f}%)\n")
-    f.write(f"Features Stable:    {stable_features} / {DATA_DIM} ({stable_features/DATA_DIM*100:.1f}%)\n\n")
-    
-    if improvement > 20:
-        f.write("✅ VERDICT: Generator learned to produce well-separated, diverse samples\n")
-    elif improvement > 5:
-        f.write("✓ VERDICT: Moderate improvement in generated sample quality\n")
-    elif improvement > -5:
-        f.write("→ VERDICT: Generated sample quality remained stable\n")
-    else:
-        f.write("❌ VERDICT: Generated sample quality degraded during training\n")
+# Save models and history
+torch.save({
+    'generator': generator.state_dict(),
+    'student': student.state_dict(),
+    'bin_learner': bin_learner.state_dict(),
+    'best_student': best_student_state,
+    'history': history
+}, f'training_history_{DATASET_NAME}.pt')
 
-print(f"✅ Variance evolution report saved to: reports/variance_evolution_{DATASET_NAME}.txt")
+print(f"\n💾 Models and history saved to: training_history_{DATASET_NAME}.pt")
+
