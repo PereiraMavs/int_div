@@ -137,7 +137,7 @@ def plot_performance_metrics(history, dataset_name, teacher_acc, warmup_acc, epo
     axs[1].set_xlim(0, epochs)
     
     # 3. Coverage Certification
-    axs[2].plot(epochs_plot, [c*100 for c in history['coverage']], 
+    axs[2].plot(epochs_plot, [c*100 for c in history['coverage_cumulative']], 
                 color='teal', linewidth=2, marker='o', markersize=4)
     axs[2].set_title('Coverage Certification', fontsize=12, fontweight='bold')
     axs[2].set_xlabel('Epoch')
@@ -260,7 +260,7 @@ def plot_combined_dashboard(history, dataset_name, teacher_acc, warmup_acc, epoc
     ax8.set_xlim(0, epochs)
     
     ax9 = fig.add_subplot(gs[2, 2])
-    ax9.plot(epochs_plot, [c*100 for c in history['coverage']], 
+    ax9.plot(epochs_plot, [c*100 for c in history['coverage_cumulative']], 
              color='teal', linewidth=2, marker='o', markersize=3)
     ax9.set_title('Coverage Certification', fontweight='bold')
     ax9.set_xlabel('Epoch')
@@ -278,7 +278,9 @@ def plot_combined_dashboard(history, dataset_name, teacher_acc, warmup_acc, epoc
     return fig, save_path
 
 
-def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save_path=None, report_interval=20):
+def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save_path=None, report_interval=20, 
+                        lambda_cov=None, lambda_hard=None, batch_size=None, num_bins=None, 
+                        num_features=None, num_classes=None, num_samples=None):
     """
     Generate comprehensive text report with all losses over epochs.
     
@@ -291,6 +293,13 @@ def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save
         save_dir: Directory to save the reports (default: 'reports')
         save_path: Optional custom path to save the report
         report_interval: Report losses every N epochs (default: 20)
+        lambda_cov: Weight for diversity loss
+        lambda_hard: Weight for hardness loss
+        batch_size: Training batch size
+        num_bins: Number of bins per feature
+        num_features: Number of features in dataset
+        num_classes: Number of classes in dataset
+        num_samples: Number of training samples
     
     Returns:
         filename: Path where the report was saved
@@ -307,9 +316,25 @@ def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save
         f.write(f"TRAINING LOSS REPORT: {dataset_name.replace('_', ' ').upper()}\n")
         f.write("=" * 120 + "\n\n")
         
-        f.write(f"Total Epochs: {epochs}\n")
-        f.write(f"Report Interval: Every {report_interval} epoch(s)\n")
-        f.write(f"Total Loss Components: 6 (Bin Total, Bin Intra, Bin Inter, Diversity, Hardness, Student)\n\n")
+        # Dataset and training configuration
+        f.write("EXPERIMENT CONFIGURATION\n")
+        f.write("-" * 120 + "\n")
+        if num_features is not None:
+            f.write(f"Dataset:                 {dataset_name}\n")
+            f.write(f"Training Samples:        {num_samples if num_samples else 'N/A'}\n")
+            f.write(f"Features:                {num_features}\n")
+            f.write(f"Classes:                 {num_classes if num_classes else 'N/A'}\n")
+            f.write(f"Bins per Feature (K):    {num_bins if num_bins else 'N/A'}\n")
+            f.write(f"Total Pairwise Bins:     {num_features * (num_features - 1) // 2 * num_bins * num_bins if (num_features and num_bins) else 'N/A'}\n\n")
+        
+        f.write("Training Hyperparameters:\n")
+        f.write(f"  Total Epochs:          {epochs}\n")
+        f.write(f"  Batch Size:            {batch_size if batch_size else 'N/A'}\n")
+        f.write(f"  Lambda Coverage:       {lambda_cov if lambda_cov else 'N/A'}\n")
+        f.write(f"  Lambda Hardness:       {lambda_hard if lambda_hard else 'N/A'}\n")
+        f.write(f"  Report Interval:       Every {report_interval} epoch(s)\n\n")
+        
+        f.write(f"Loss Components: 6 (Bin Total, Bin Intra, Bin Inter, Diversity, Hardness, Student)\n\n")
         
         # Section 1: Loss Evolution Over Epochs
         f.write("=" * 120 + "\n")
@@ -321,18 +346,22 @@ def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save
         f.write("-" * 120 + "\n")
         
         # Report losses at specified intervals
-        for epoch in range(1, epochs + 1):
-            if epoch % report_interval == 0 or epoch == 1:
-                idx = epoch - 1
-                bin_total = history['bin_total'][idx]
-                bin_intra = history['bin_intra'][idx]
-                bin_inter = history['bin_inter'][idx]
-                inter_dist = -bin_inter  # Negated to show as distance
-                diversity = history['diversity'][idx]
-                hardness = history['hardness'][idx]
-                student = history['student'][idx]
-                
-                f.write(f"{epoch:<8} | {bin_total:<12.6f} | {bin_intra:<12.6f} | {bin_inter:<12.6f} | {inter_dist:<12.6f} | {diversity:<12.6f} | {hardness:<12.6f} | {student:<12.6f}\n")
+        # Phase 1 (Bin Learner): Uses bin_total/bin_intra/bin_inter indices  
+        # Phase 2 (Distillation): Uses diversity/hardness/student indices
+        for i, epoch in enumerate(range(report_interval, epochs + 1, report_interval)):
+            # Bin losses are logged every 20 epochs during Phase 1 only
+            bin_idx = i if i < len(history["bin_total"]) else len(history["bin_total"]) - 1
+            bin_total = history["bin_total"][bin_idx]
+            bin_intra = history["bin_intra"][bin_idx]
+            bin_inter = history["bin_inter"][bin_idx]
+            
+            # Phase 2 losses are logged throughout training
+            diversity = history["diversity"][i]
+            hardness = history['hardness'][i]
+            student = history['student'][i]
+            inter_dist = -bin_inter
+            
+            f.write(f"{epoch:<8} | {bin_total:<12.6f} | {bin_intra:<12.6f} | {bin_inter:<12.6f} | {inter_dist:<12.6f} | {diversity:<12.6f} | {hardness:<12.6f} | {student:<12.6f}\n")
         
         # Section 2: Loss Statistics Summary
         f.write("\n" + "=" * 120 + "\n")
@@ -371,7 +400,7 @@ def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save
             f.write("\n")
         
         # Section 3: Performance Metrics Over Epochs
-        if history['test_acc']:  # Check if performance metrics are available
+        if history.get('test_acc'):  # Check if performance metrics are available
             f.write("=" * 120 + "\n")
             f.write("SECTION 3: PERFORMANCE METRICS OVER EPOCHS\n")
             f.write("=" * 120 + "\n\n")
@@ -382,7 +411,7 @@ def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save
             for i, epoch in enumerate(range(report_interval, epochs + 1, report_interval)):
                 test_acc = history['test_acc'][i] * 100
                 agreement = history['agreement'][i] * 100
-                coverage = history['coverage'][i] * 100
+                coverage = history['coverage_cumulative'][i] * 100
                 
                 f.write(f"{epoch:<8} | {test_acc:<15.2f}% | {agreement:<15.2f}% | {coverage:<15.2f}%\n")
             
@@ -401,10 +430,17 @@ def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save
             f.write(f"    Change:   {(history['agreement'][-1] - history['agreement'][0])*100:+.2f}%\n\n")
             
             f.write(f"  Coverage Certification:\n")
-            f.write(f"    Initial:  {history['coverage'][0]*100:.2f}%\n")
-            f.write(f"    Final:    {history['coverage'][-1]*100:.2f}%\n")
-            f.write(f"    Best:     {max(history['coverage'])*100:.2f}%\n")
-            f.write(f"    Change:   {(history['coverage'][-1] - history['coverage'][0])*100:+.2f}%\n\n")
+            f.write(f"    Initial:  {history['coverage_cumulative'][0]*100:.2f}%\n")
+            f.write(f"    Final:    {history['coverage_cumulative'][-1]*100:.2f}%\n")
+            f.write(f"    Best:     {max(history['coverage_cumulative'])*100:.2f}%\n")
+            f.write(f"    Change:   {(history['coverage_cumulative'][-1] - history['coverage_cumulative'][0])*100:+.2f}%\n")
+            
+            # Coverage details
+            if num_features and num_bins:
+                total_pairs = num_features * (num_features - 1) // 2 * num_bins * num_bins
+                best_coverage = max(history['coverage_cumulative'])
+                f.write(f"    Best Pairs Covered: {int(best_coverage * total_pairs)} / {total_pairs}\n")
+            f.write("\n")
         
         # Section 4: Training Observations
         f.write("=" * 120 + "\n")
@@ -412,26 +448,26 @@ def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save
         f.write("=" * 120 + "\n\n")
         
         # Analyze trends
-        bin_total_trend = "decreasing" if history['bin_total'][-1] < history['bin_total'][0] else "increasing"
-        intra_trend = "decreasing" if history['bin_intra'][-1] < history['bin_intra'][0] else "increasing"
+        bin_total_trend = "DECREASING" if history['bin_total'][-1] < history['bin_total'][0] else "INCREASING"
+        intra_trend = "INCREASING" if history['bin_intra'][-1] > history['bin_intra'][0] else "DECREASING"
         inter_dist = [-x for x in history['bin_inter']]
-        inter_trend = "increasing" if inter_dist[-1] > inter_dist[0] else "decreasing"
-        student_trend = "decreasing" if history['student'][-1] < history['student'][0] else "increasing"
+        inter_trend = "INCREASING" if inter_dist[-1] > inter_dist[0] else "DECREASING"
+        student_trend = "DECREASING" if history['student'][-1] < history['student'][0] else "INCREASING"
         
         f.write(f"Loss Trends:\n")
-        f.write(f"  • Total Bin Loss:       {bin_total_trend.upper()}\n")
-        f.write(f"  • Intra-Bin Loss:       {intra_trend.upper()} (purer bins)\n")
-        f.write(f"  • Inter-Bin Distance:   {inter_trend.upper()} (better separation)\n")
-        f.write(f"  • Student KD Loss:      {student_trend.upper()}\n\n")
+        f.write(f"  • Total Bin Loss:       {bin_total_trend}\n")
+        f.write(f"  • Intra-Bin Loss:       {intra_trend} (purer bins)\n")
+        f.write(f"  • Inter-Bin Distance:   {inter_trend} (better separation)\n")
+        f.write(f"  • Student KD Loss:      {student_trend}\n\n")
         
         # Quality assessment
         f.write("Quality Assessment:\n")
-        if intra_trend == "decreasing" and inter_trend == "increasing":
+        if intra_trend == "DECREASING" and inter_trend == "INCREASING":
             f.write("  ✓ EXCELLENT: Bins are becoming purer (lower intra) and more separated (higher inter)\n")
-        elif intra_trend == "decreasing":
+        elif intra_trend == "DECREASING":
             f.write("  ⚠ PARTIAL: Bins are purer but separation is not improving\n")
-        elif inter_trend == "increasing":
-            f.write("  ⚠ PARTIAL: Bin separation is improving but purity is not\n")
+        elif inter_trend == "INCREASING":
+            f.write("  ⚠ PARTIAL: Bin separation is improving but purity is not optimal\n")
         else:
             f.write("  ✗ NEEDS IMPROVEMENT: Consider adjusting temperature schedule or loss weights\n")
         
