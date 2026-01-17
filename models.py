@@ -194,3 +194,80 @@ class RandomForestTeacherWrapper(nn.Module):
         """Override eval() - Random Forest doesn't have eval mode"""
         # Keep PyTorch happy but don't do anything
         return self
+
+
+class TabTransformer(nn.Module):
+    """
+    TabTransformer: Transformer architecture for tabular data.
+    Uses column embeddings and self-attention to model feature interactions.
+    
+    Architecture:
+    - Continuous features: Linear projection
+    - Categorical features: Embedding lookup (all features treated as continuous here)
+    - Column embeddings: Learnable position-like embeddings for each feature
+    - Transformer encoder: Multi-head self-attention layers
+    - Output: MLP classifier on [CLS] token or mean pooling
+    """
+    def __init__(self, input_dim, num_classes, d_model=32, nhead=2, num_layers=1, dim_feedforward=128, dropout=0.1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+        
+        # [CLS] token for classification
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+        
+        # Feature projection to d_model dimensions
+        self.feature_projection = nn.Linear(1, d_model)
+        
+        # Column embeddings (learnable positional-like embeddings for each feature)
+        self.column_embeddings = nn.Parameter(torch.randn(input_dim, d_model))
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, num_classes)
+        )
+        
+    def forward(self, x):
+        """
+        Args:
+            x: (batch_size, input_dim) continuous features
+        Returns:
+            logits: (batch_size, num_classes)
+        """
+        batch_size = x.shape[0]
+        
+        # Project each feature to d_model: (batch, features, 1) -> (batch, features, d_model)
+        x = x.unsqueeze(-1)  # (batch, input_dim, 1)
+        x = self.feature_projection(x)  # (batch, input_dim, d_model)
+        
+        # Add column embeddings
+        x = x + self.column_embeddings.unsqueeze(0)  # (batch, input_dim, d_model)
+        
+        # Prepend [CLS] token
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # (batch, 1, d_model)
+        x = torch.cat([cls_tokens, x], dim=1)  # (batch, input_dim+1, d_model)
+        
+        # Apply transformer
+        x = self.transformer(x)  # (batch, input_dim+1, d_model)
+        
+        # Use [CLS] token for classification
+        cls_output = x[:, 0, :]  # (batch, d_model)
+        
+        # Classification
+        logits = self.classifier(cls_output)  # (batch, num_classes)
+        
+        return logits
