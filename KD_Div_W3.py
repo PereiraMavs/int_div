@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import numpy as np
 import os
 import sys
@@ -18,7 +18,7 @@ import visualization  # Custom visualization module
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description='Knowledge Distillation with Adversarial Training')
-parser.add_argument('--teacher', type=str, default='neural', choices=['neural', 'xgboost', 'randomforest'],
+parser.add_argument('--teacher', type=str, default='neural', choices=['neural', 'xgboost', 'randomforest', 'tabtransformer'],
                     help='Teacher model type (default: neural)')
 parser.add_argument('--dataset', type=str, default='adult',
                     help='Dataset name (default: adult)')
@@ -58,7 +58,7 @@ class TeeLogger:
         self.log.close()
 
 # Training Params
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 EPOCHS = 400
 LATENT_DIM = 32     # Generator Noise Dimension
 NUM_BINS = 8        # Bins per feature (K)
@@ -69,11 +69,14 @@ WARMUP_SAMPLES = 500  # Number of random samples per warmup epoch
 
 # Replay buffer parameters
 REPLAY_BUFFER_SIZE = 1000  # Maximum samples to store
-REPLAY_RATIO = 0.10  # 10% of batch will be replay samples
+REPLAY_RATIO = 0.20  # 10% of batch will be replay samples
 
 # Weights
-LAMBDA_COV = 2.0    # Weight for Interaction Diversity (Entropy)
-LAMBDA_HARD = 12.0   # Weight for Adversarial Hardness
+LAMBDA_COV = 3.0    # Weight for Interaction Diversity (Entropy)
+LAMBDA_HARD = 8.0   # Weight for Adversarial Hardness
+LAMBDA_CONTRASTIVE = 2  # Weight for contrastive diversity loss used in Phase 1
+LAMBDA_STUDENT_DIV = 1.5  # Weight for student diversity loss
+LAMBDA_BOUNDARY = 0.5  # Weight for boundary sampling loss (teacher entropy)
 
 # ==========================================
 # 1. DATA PREPARATION
@@ -357,6 +360,65 @@ elif TEACHER_TYPE == 'randomforest':
     # Random Forest wrapper returns probabilities, not logits
     teacher_outputs_probs = True
 
+elif TEACHER_TYPE == 'tabtransformer':
+    # TabTransformer teacher
+    from models import TabTransformer
+    
+    print("   Training TabTransformer classifier...")
+    print("   ⚠️  Using CPU for TabTransformer to avoid GPU OOM")
+    
+    # Use CPU for TabTransformer due to memory requirements
+    teacher_device = torch.device('cpu')
+    teacher = TabTransformer(
+        input_dim=DATA_DIM,
+        num_classes=NUM_CLASSES,
+        d_model=32,  # Reduced from 64 to save memory
+        nhead=2,     # Reduced from 4 to save memory
+        num_layers=2,  # Reduced from 3 to save memory
+        dim_feedforward=64,  # Reduced from 128 to save memory
+        dropout=0.1
+    ).to(teacher_device)
+    
+    # Move training data to CPU
+    X_train_cpu = X_train_tensor.to(teacher_device)
+    y_train_cpu = y_train_tensor.to(teacher_device)
+    X_test_cpu = X_test_tensor.to(teacher_device)
+    y_test_cpu = y_test_tensor.to(teacher_device)
+    
+    t_opt = optim.AdamW(teacher.parameters(), lr=0.001, weight_decay=0.01)
+    t_crit = nn.CrossEntropyLoss()
+    
+    # Train for more epochs due to transformer complexity
+    num_epochs = 100
+    for e in range(num_epochs):
+        teacher.train()
+        t_opt.zero_grad()
+        logits = teacher(X_train_cpu)
+        loss = t_crit(logits, y_train_cpu)
+        loss.backward()
+        t_opt.step()
+    
+    # Evaluate Teacher
+    teacher.eval()
+    with torch.no_grad():
+        teacher_train_logits = teacher(X_train_cpu)
+        teacher_train_preds = torch.argmax(teacher_train_logits, dim=1)
+        teacher_train_acc = accuracy_score(y_train, teacher_train_preds.cpu().numpy())
+        
+        teacher_test_logits = teacher(X_test_cpu)
+        teacher_test_preds = torch.argmax(teacher_test_logits, dim=1)
+        teacher_test_acc = accuracy_score(y_test, teacher_test_preds.cpu().numpy())
+    
+    print(f"✅ TabTransformer Teacher Trained.")
+    print(f"   Train Accuracy: {teacher_train_acc*100:.2f}%")
+    print(f"   Test Accuracy:  {teacher_test_acc*100:.2f}%")
+    
+    # Move teacher back to GPU for inference during training
+    teacher = teacher.to(DEVICE)
+    
+    # TabTransformer outputs logits, not probabilities
+    teacher_outputs_probs = False
+
 else:
     raise ValueError(f"Unknown TEACHER_TYPE: {TEACHER_TYPE}")
 
@@ -382,7 +444,7 @@ elif TEACHER_TYPE == 'randomforest':
     # Use harder boundaries to match the discrete nature of RF
     PHASE1_TEMP_START = 1.2   # Slightly softer than neural
     PHASE1_TEMP_END = 0.08    # Almost as hard as neural
-    PHASE2_TEMP = 0.25         # Moderately hard boundaries
+    PHASE2_TEMP = 0.5         # Moderately hard boundaries
     DISTILL_TEMPERATURE = 1.5  # Less softening than XGBoost (RF already very sharp)
     print(f"\n🌡️  Using MODERATE temperature schedule (RandomForest teacher)")
 else:
@@ -407,6 +469,8 @@ student = StudentNet(DATA_DIM, NUM_CLASSES).to(DEVICE)
 # 4.5 STUDENT WARMUP WITH RANDOM DATA + REPLAY BUFFER FILLING
 # ==========================================
 print("\n🔥 Warming up Student with Random Data...")
+# Clear GPU cache
+torch.cuda.empty_cache()
 print(f"   Generating {WARMUP_SAMPLES} random samples per epoch for {WARMUP_EPOCHS} epochs")
 print(f"   Storing samples in replay buffer (max: {REPLAY_BUFFER_SIZE})")
 
@@ -471,30 +535,97 @@ history = {
     "bin_total": [],
     "bin_intra": [],
     "bin_inter": [],
-    "student_div": [],  # NEW: Track student diversity loss
+    "student_div": [],  # Track student diversity loss
+    "boundary": [],  # Track boundary sampling loss
+    "hardness_phase1": [],  # Track hardness in Phase 1
+    "f1_score": [],  # Track F1 score
+    "auc_score": [],  # Track AUC score
 }
 
-print("\n📍 PHASE 1: Training Bin Learner + Generator (Student Prediction Diversity)...")
+print("\n📍 PHASE 1: Training Bin Learner + Generator (Student Diversity + Boundary Sampling)...")
 print(f"   Bin Learner: Learning stable boundaries")
-print(f"   Generator: Training to maximize student prediction diversity")
+print(f"   Generator: Training to maximize student prediction diversity + teacher entropy")
 print(f"   Student: Frozen during Phase 1 (using warmup state)")
 
-BIN_LEARNER_EPOCHS = 100
+# Freeze student during Phase 1
+for param in student.parameters():
+    param.requires_grad = False
+
+BIN_LEARNER_EPOCHS = 200
 loss_bin_fn = VarianceBasedBinLoss()
 
 # ==========================================
-# STUDENT PREDICTION DIVERSITY LOSS
+# CONTRASTIVE DIVERSITY LOSS
 # ==========================================
+class ContrastiveDiversityLoss(nn.Module):
+    """
+    Contrastive Diversity Loss: Encourages generator to produce dissimilar samples.
+    
+    Works by:
+    1. Computing pairwise distances between all samples in a batch
+    2. Penalizing samples that are too close together
+    3. No gradients through teacher required - purely feature-based
+    
+    This approach:
+    - Works with ANY teacher type (neural, XGBoost, RandomForest)
+    - Directly maximizes diversity in feature space
+    - Avoids adversarial bias (unlike student diversity)
+    - Helps bin learner see wide range of feature values
+    """
+    def __init__(self, margin=1.5, temperature=0.3):
+        super(ContrastiveDiversityLoss, self).__init__()
+        self.margin = margin
+        self.temperature = temperature
+    
+    def forward(self, x_gen):
+        """
+        Args:
+            x_gen: Generated samples, shape (N, D)
+        
+        Returns:
+            loss: Contrastive loss (lower = more diverse)
+        """
+        # Normalize samples for better distance computation
+        x_norm = F.normalize(x_gen, p=2, dim=1)
+        
+        # Compute pairwise cosine similarity matrix
+        # sim[i,j] = similarity between sample i and sample j
+        sim_matrix = torch.mm(x_norm, x_norm.t())  # (N, N)
+        
+        # Remove diagonal (self-similarity)
+        mask = torch.eye(sim_matrix.size(0), device=x_gen.device).bool()
+        sim_matrix = sim_matrix.masked_fill(mask, -1e9)
+        
+        # Apply temperature scaling (sharpen differences)
+        sim_matrix = sim_matrix / self.temperature
+        
+        # Convert to distances: d = 1 - similarity
+        dist_matrix = 1.0 - sim_matrix
+        
+        # Penalize small distances (samples too similar)
+        # Use hinge loss: max(0, margin - distance)
+        violations = F.relu(self.margin - dist_matrix)
+        
+        # Average over all pairs
+        loss = violations.mean()
+        
+        return loss
+
+loss_contrastive_fn = ContrastiveDiversityLoss(margin=1.5, temperature=0.3)
+
 class StudentPredictionDiversityLoss(nn.Module):
     """
     Student Prediction Diversity Loss: Maximizes entropy of student predictions.
     
-    This works because gradients flow through the student (differentiable NN),
-    not through the teacher (which may be a non-differentiable tree model).
+    This encourages generator to produce samples where student's average 
+    predictions are uniform across all classes (maximum disagreement/diversity).
     
-    L_student_div = -H(α) where α = E[student(x_gen)]
+    Works by computing gradients through the student network (differentiable),
+    making it compatible with any teacher type (neural, XGBoost, RandomForest).
     
-    Lower loss = higher prediction entropy = more diverse samples
+    L_student_div = -H(α) where α = E[P_student(y|x_gen)]
+    
+    Lower loss = higher prediction entropy = more diverse predictions
     """
     def __init__(self):
         super(StudentPredictionDiversityLoss, self).__init__()
@@ -505,15 +636,16 @@ class StudentPredictionDiversityLoss(nn.Module):
             student_logits: Student predictions, shape (N, C) where C=num_classes
         
         Returns:
-            loss: Negative entropy (scalar)
+            loss: Negative entropy (scalar) - minimize to maximize diversity
         """
         # Convert logits to probabilities
         probs = F.softmax(student_logits, dim=1)  # Shape: (N, C)
         
         # Compute average prediction across batch
+        # If student predicts uniformly [0.5, 0.5] on all samples, α = [0.5, 0.5] = max entropy
         alpha = probs.mean(dim=0)  # Shape: (C,)
         
-        # Compute entropy: H(α) = -Σ(α_j * log(α_j))
+        # Compute entropy: H(α) = -Σ(α_c * log(α_c))
         entropy = -(alpha * torch.log(alpha + 1e-8)).sum()
         
         # Return negative entropy (we want to MAXIMIZE entropy, so MINIMIZE negative)
@@ -523,28 +655,61 @@ class StudentPredictionDiversityLoss(nn.Module):
 
 loss_student_div_fn = StudentPredictionDiversityLoss()
 
+class BoundarySamplingLoss(nn.Module):
+    """
+    Boundary Sampling Loss: Maximizes teacher prediction entropy.
+    
+    This encourages generator to produce samples where the teacher is uncertain
+    (near natural decision boundaries), not where student makes errors.
+    
+    Key difference from hardness loss:
+    - Hardness: -KL(student || teacher) → adversarial (student ≠ teacher)
+    - Boundary: -H(P_teacher) → natural boundaries (teacher uncertain)
+    
+    L_boundary = -H(P_teacher) = Σ(p_c * log(p_c))
+    
+    Lower loss = higher teacher entropy = samples at decision boundaries
+    """
+    def __init__(self):
+        super(BoundarySamplingLoss, self).__init__()
+    
+    def forward(self, teacher_probs):
+        """
+        Args:
+            teacher_probs: Teacher predictions, shape (N, C) where C=num_classes
+        
+        Returns:
+            loss: Negative entropy (scalar) - minimize to maximize uncertainty
+        """
+        # Compute entropy for each sample: H(p) = -Σ(p_c * log(p_c))
+        # Shape: teacher_probs is (N, C), entropy is (N,)
+        entropy_per_sample = -(teacher_probs * torch.log(teacher_probs + 1e-8)).sum(dim=1)
+        
+        # Return negative mean entropy (we want to MAXIMIZE entropy)
+        loss = -entropy_per_sample.mean()
+        
+        return loss
+
+loss_boundary_fn = BoundarySamplingLoss()
+
 # Optimizers for Phase 1 - Bin learner AND generator
 opt_bin = optim.Adam(bin_learner.parameters(), lr=0.01)
-opt_gen_phase1 = optim.Adam(generator.parameters(), lr=0.001)
+opt_gen_phase1 = optim.Adam(generator.parameters(), lr=0.0001)
 
 # Schedulers
 scheduler_bin = optim.lr_scheduler.CosineAnnealingLR(opt_bin, T_max=BIN_LEARNER_EPOCHS)
 scheduler_gen_phase1 = optim.lr_scheduler.CosineAnnealingLR(opt_gen_phase1, T_max=BIN_LEARNER_EPOCHS)
 
-# Freeze student during Phase 1 (it will be trained in Phase 2)
-for param in student.parameters():
-    param.requires_grad = False
-
-# Weight for student diversity loss
-LAMBDA_STUDENT_DIV = 2.0
+# NOTE: No need to freeze student in Phase 1 since contrastive learning doesn't use it
+# Student remains trainable and ready for Phase 2
 
 # Track bin boundaries AND variance over epochs
 boundary_history = []
 variance_history = []
 boundary_checkpoints = list(range(0, BIN_LEARNER_EPOCHS + 1, 20))
 
-print(f"\n{'Epoch':<6} | {'Bin Total':<10} | {'Intra':<10} | {'Inter':<10} | {'Stu Div':<10} | {'Intra Var':<12} | {'Inter Var':<12}")
-print("-" * 110)
+print(f"\n{'Epoch':<6} | {'Bin Total':<10} | {'Intra':<10} | {'Inter':<10} | {'Stu Div':<10} | {'Boundary':<10} | {'Intra Var':<12} | {'Inter Var':<12}")
+print("-" * 140)
 
 # Capture initial boundaries and variance (epoch 0)
 with torch.no_grad():
@@ -576,19 +741,24 @@ for epoch in range(1, BIN_LEARNER_EPOCHS + 1):
     bin_learner.temperature = PHASE1_TEMP_START - ((PHASE1_TEMP_START - PHASE1_TEMP_END) * (epoch / BIN_LEARNER_EPOCHS))
     
     # ==========================
-    # GENERATOR UPDATE (Student Prediction Diversity)
+    # GENERATOR UPDATE (Student Prediction Diversity + Boundary Sampling)
     # ==========================
     opt_gen_phase1.zero_grad()
     
     z_gen = torch.randn(BATCH_SIZE, LATENT_DIM).to(DEVICE)
     x_gen = generator(z_gen)
     
-    # Get student predictions (student is frozen, but gradients flow through it)
+    # Student diversity loss (gradients flow through student network)
     student_logits = student(x_gen)
     l_student_div = loss_student_div_fn(student_logits)
     
-    # Weighted loss
-    l_gen_phase1 = LAMBDA_STUDENT_DIV * l_student_div
+    # Boundary sampling loss (maximize teacher entropy at decision boundaries)
+    with torch.no_grad():
+        t_probs_gen = get_teacher_probs(x_gen)
+    l_boundary = loss_boundary_fn(t_probs_gen)
+    
+    # Combined loss (NO hardness in Phase 1 - use boundary sampling instead)
+    l_gen_phase1 = (LAMBDA_STUDENT_DIV * l_student_div) + (LAMBDA_BOUNDARY * l_boundary)
     
     if not torch.isnan(l_gen_phase1):
         l_gen_phase1.backward()
@@ -647,21 +817,18 @@ for epoch in range(1, BIN_LEARNER_EPOCHS + 1):
             })
     
     if epoch % 20 == 0:
-        print(f"{epoch:<6} | {l_bin.item():<10.5f} | {l_intra.item():<10.5f} | {l_inter.item():<10.5f} | {l_student_div.item():<10.5f} | {intra_var:<12.5f} | {inter_var:<12.5f}")
+        print(f"{epoch:<6} | {l_bin.item():<10.5f} | {l_intra.item():<10.5f} | {l_inter.item():<10.5f} | {l_student_div.item():<10.5f} | {l_boundary.item():<10.5f} | {intra_var:<12.5f} | {inter_var:<12.5f}")
         
         # Store in history
         history['bin_total'].append(l_bin.item())
         history['bin_intra'].append(l_intra.item())
         history['bin_inter'].append(l_inter.item())
         history['student_div'].append(l_student_div.item())
+        history['boundary'].append(l_boundary.item())
 
 print(f"✅ Phase 1 Complete!")
 print(f"   Bin boundaries are now frozen")
-print(f"   Generator trained to maximize student prediction diversity")
-
-# Unfreeze student for Phase 2
-for param in student.parameters():
-    param.requires_grad = True
+print(f"   Generator trained with student diversity + boundary sampling")
 
 # ==========================================
 # C.1 VISUALIZE BIN BOUNDARY EVOLUTION
@@ -921,17 +1088,17 @@ print(f"✅ Variance evolution report saved to: {os.path.join(TEACHER_REPORTS_DI
 # D. PHASE 2: KNOWLEDGE DISTILLATION (Generator + Student)
 # ==========================================
 
-print("\n🔄 Re-initializing Generator for Phase 2...")
-generator = Generator(LATENT_DIM, DATA_DIM, X_mean, X_min, X_max).to(DEVICE)
-print("   Generator reset to fresh random weights")
-print("   This avoids carrying Phase 1's class-diversity bias into Phase 2")
-
 print("\n🎓 PHASE 2: Knowledge Distillation with Frozen Bins...")
+print("   Using Phase 1 generator (trained with contrastive diversity)")
 print(f"   Generator: Fresh start - Hardness + Diversity Loss")
 print(f"   Student: KL Divergence Loss")
 print(f"   Bin Learner: FROZEN")
 
 # Freeze bin learner
+
+# Unfreeze student for Phase 2
+for param in student.parameters():
+    param.requires_grad = True
 for param in bin_learner.parameters():
     param.requires_grad = False
 
@@ -961,8 +1128,8 @@ print(f"   Total possible bin pairs to explore: {total_possible_pairs}")
 
 # History tracking
 
-print(f"\n{'Epoch':<6} | {'Div':<8} | {'Hard':<8} | {'Stu':<8} | {'Test Acc':<10} | {'Agreement':<10} | {'Cov (Snap)':<12} | {'Cov (Cumul)':<12}")
-print("-" * 120)
+print(f"\n{'Epoch':<6} | {'Div':<8} | {'Hard':<8} | {'Stu':<8} | {'Test Acc':<10} | {'Agreement':<10} | {'F1 Score':<10} | {'AUC Score':<10} | {'Cov (Snap)':<12} | {'Cov (Cumul)':<12}")
+print("-" * 150)
 
 best_student_state = None
 best_agreement_score = 0.0
@@ -989,6 +1156,12 @@ for epoch in range(1, EPOCHS + 1):
     # 3. Coverage Bonus (Reward unexplored bins)
     l_coverage = compute_coverage_bonus(mship, cumulative_coverage_tracker)
 
+    
+    #if epoch < 150:
+    #    LAMBDA_COV = 0.0
+    #else:
+    #    LAMBDA_COV = 0.7
+    
     # Combine losses
     l_gen = (LAMBDA_COV * l_div) + (LAMBDA_HARD * l_hard) #+ (8.0 * l_coverage)
 
@@ -1093,6 +1266,18 @@ for epoch in range(1, EPOCHS + 1):
             test_acc = accuracy_score(y_test, s_test_preds.cpu().numpy())
             agreement = (t_test_preds == s_test_preds).float().mean().item()
             
+            # Calculate F1 score (weighted average for multi-class)
+            f1 = f1_score(y_test, s_test_preds.cpu().numpy(), average='weighted')
+            
+            # Calculate AUC score (one-vs-rest for multi-class)
+            student_probs = F.softmax(student(X_test_tensor), dim=1).cpu().numpy()
+            if NUM_CLASSES == 2:
+                # Binary classification: use probabilities of positive class
+                auc = roc_auc_score(y_test, student_probs[:, 1])
+            else:
+                # Multi-class: use one-vs-rest strategy
+                auc = roc_auc_score(y_test, student_probs, multi_class='ovr', average='weighted')
+            
             # Compute SNAPSHOT coverage (fresh 1000 samples)
             z_cov = torch.randn(1000, LATENT_DIM).to(DEVICE)
             x_cov = generator(z_cov)
@@ -1101,11 +1286,13 @@ for epoch in range(1, EPOCHS + 1):
         
         history['test_acc'].append(test_acc)
         history['agreement'].append(agreement)
+        history['f1_score'].append(f1)
+        history['auc_score'].append(auc)
         history['coverage_snapshot'].append(snapshot_cov)
         
         student.train()
         
-        print(f"{epoch:<6} | {l_div.item():<8.1f} | {l_hard.item():<8.3f} | {l_stu.item():<8.3f} | {test_acc*100:<10.1f}% | {agreement*100:<10.1f}% | {snapshot_cov*100:<12.1f}% | {cumulative_cov*100:<12.1f}%")
+        print(f"{epoch:<6} | {l_div.item():<8.1f} | {l_hard.item():<8.3f} | {l_stu.item():<8.3f} | {test_acc*100:<10.1f}% | {agreement*100:<10.1f}% | {f1:<10.4f} | {auc:<10.4f} | {snapshot_cov*100:<12.1f}% | {cumulative_cov*100:<12.1f}%")
         
         # Track best student model
         if agreement > best_agreement_score:
@@ -1115,6 +1302,8 @@ for epoch in range(1, EPOCHS + 1):
                 'model_state_dict': student.state_dict(),
                 'test_acc': test_acc,
                 'agreement': agreement,
+                'f1_score': f1,
+                'auc_score': auc,
                 'coverage_snapshot': snapshot_cov,
                 'coverage_cumulative': cumulative_cov
             }
@@ -1123,6 +1312,8 @@ print(f"\n✅ Phase 2 Complete!")
 print(f"   Best Student (Epoch {best_student_state['epoch']}):")
 print(f"   - Test Accuracy: {best_student_state['test_acc']*100:.2f}%")
 print(f"   - Agreement with Teacher: {best_student_state['agreement']*100:.2f}%")
+print(f"   - F1 Score: {best_student_state['f1_score']:.4f}")
+print(f"   - AUC Score: {best_student_state['auc_score']:.4f}")
 print(f"   - Snapshot Coverage: {best_student_state['coverage_snapshot']*100:.2f}%")
 print(f"   - Cumulative Coverage: {best_student_state['coverage_cumulative']*100:.2f}%")
 print(f"   - Total bin pairs explored: {int(best_student_state['coverage_cumulative'] * total_possible_pairs)} / {total_possible_pairs}")

@@ -350,10 +350,17 @@ def generate_loss_report(history, dataset_name, epochs, save_dir='reports', save
         # Phase 2 (Distillation): Uses diversity/hardness/student indices
         for i, epoch in enumerate(range(report_interval, epochs + 1, report_interval)):
             # Bin losses are logged every 20 epochs during Phase 1 only
-            bin_idx = i if i < len(history["bin_total"]) else len(history["bin_total"]) - 1
-            bin_total = history["bin_total"][bin_idx]
-            bin_intra = history["bin_intra"][bin_idx]
-            bin_inter = history["bin_inter"][bin_idx]
+            # Handle case where Phase 1 was skipped (ablation study - static bins)
+            if len(history["bin_total"]) > 0:
+                bin_idx = min(i, len(history["bin_total"]) - 1)
+                bin_total = history["bin_total"][bin_idx]
+                bin_intra = history["bin_intra"][bin_idx]
+                bin_inter = history["bin_inter"][bin_idx]
+            else:
+                # Phase 1 was skipped - use zeros
+                bin_total = 0.0
+                bin_intra = 0.0
+                bin_inter = 0.0
             
             # Phase 2 losses are logged throughout training
             diversity = history["diversity"][i]
